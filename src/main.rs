@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -11,8 +11,6 @@ use minio::s3::types::S3Api;
 use minio::s3::MinioClient;
 use nix::unistd::setsid;
 use serde::Deserialize;
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -30,24 +28,23 @@ struct Alias {
     s3_key: Option<String>,
 }
 
-fn load_config() -> Result<Config> {
-    let home = dirs::home_dir().ok_or("could not determine home directory")?;
+fn load_config() -> Result<Config, String> {
+    let home = dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     let path = home.join(".secrets/gossh/config.yaml");
 
     if !path.exists() {
         return Err(format!(
             "config file not found at {}\nCreate it or pass a direct user@host (e.g. user@1.2.3.4)",
             path.display()
-        )
-        .into());
+        ));
     }
 
-    let data = std::fs::read_to_string(&path)?;
-    let cfg: Config = serde_yaml::from_str(&data)?;
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let cfg: Config = serde_yaml::from_str(&data).map_err(|e| e.to_string())?;
     Ok(cfg)
 }
 
-fn resolve_target(cfg: &Config, name: &str) -> Result<(String, String)> {
+fn resolve_target(cfg: &Config, name: &str) -> Result<(String, String), String> {
     if let Some(alias) = cfg.aliases.get(name) {
         // If s3_key is not specified, default to the alias name itself (useful for flat bucket storage)
         let key = alias.s3_key.clone().unwrap_or_else(|| name.to_string());
@@ -57,34 +54,29 @@ fn resolve_target(cfg: &Config, name: &str) -> Result<(String, String)> {
     Err(format!(
         "unknown alias '{}' and it does not look like a direct SSH target",
         name
-    )
-    .into())
+    ))
 }
 
-async fn fetch_key(
-    endpoint: &str,
-    bucket: &str,
-    key: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> Result<Vec<u8>> {
-    let base_url: BaseUrl = endpoint
+async fn fetch_key(cfg: &Config, key: &str, secret_key: &str) -> Result<Vec<u8>, String> {
+    let base_url: BaseUrl = cfg
+        .endpoint
         .parse()
         .map_err(|e| format!("invalid S3 endpoint URL: {}", e))?;
-    let provider = StaticProvider::new(access_key, secret_key, None);
+    let provider = StaticProvider::new(&cfg.minio_user, secret_key, None);
 
     let client = MinioClient::new(base_url, Some(provider), None, None)
         .map_err(|e| format!("failed to create MinIO client: {}", e))?;
 
     let resp = client
         .get_object(
-            bucket,
+            &cfg.bucket,
             minio::s3::types::ObjectKey::new(key).map_err(|e| format!("{}", e))?,
-        )?
+        )
+        .map_err(|e| format!("minio get_object failed: {}", e))?
         .build()
         .send()
         .await
-        .map_err(|e| format!("failed to get object s3://{}/{}: {}", bucket, key, e))?;
+        .map_err(|e| format!("failed to get object s3://{}/{}: {}", cfg.bucket, key, e))?;
 
     let data = resp
         .into_bytes()
@@ -94,31 +86,7 @@ async fn fetch_key(
     Ok(data.to_vec())
 }
 
-fn maybe_decrypt_age(data: Vec<u8>) -> Result<Vec<u8>> {
-    const AGE_MAGIC: &[u8] = b"age-encryption.org/";
-
-    if !data.starts_with(AGE_MAGIC) {
-        return Ok(data);
-    }
-
-    // Prompt on stderr
-    eprint!("Enter passphrase for encrypted key: ");
-    let passphrase =
-        rpassword::prompt_password("").map_err(|e| format!("failed to read passphrase: {}", e))?;
-
-    let decryptor = match age::Decryptor::new(&data[..])? {
-        age::Decryptor::Passphrase(d) => d,
-        _ => return Err("not a passphrase-encrypted age file".into()),
-    };
-
-    let mut decrypted = vec![];
-    let mut reader = decryptor.decrypt(&age::secrecy::Secret::new(passphrase), None)?;
-    reader.read_to_end(&mut decrypted)?;
-
-    Ok(decrypted)
-}
-
-fn create_key_file(key: &[u8]) -> Result<(String, std::fs::File)> {
+fn create_key_file(key: &[u8]) -> Result<(String, std::fs::File), String> {
     // Use /dev/shm (tmpfs) so the key lives only in memory, no disk.
     // This is much more compatible with ssh's file handling than /proc/self/fd.
     let path = format!("/dev/shm/gossh-key-{}", std::process::id());
@@ -132,8 +100,9 @@ fn create_key_file(key: &[u8]) -> Result<(String, std::fs::File)> {
         .open(&path)
         .map_err(|e| format!("failed to create key file at {}: {}", path, e))?;
 
-    file.write_all(key)?;
-    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(key).map_err(|e| e.to_string())?;
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| e.to_string())?;
 
     // We keep the File open so the content stays alive even after we unlink.
     Ok((path, file))
@@ -143,7 +112,7 @@ fn exec_ssh(
     target: &str,
     key_file: Option<(String, std::fs::File)>,
     extra_args: &[String],
-) -> Result<()> {
+) -> Result<(), String> {
     let ssh_path = which::which("ssh").unwrap_or_else(|_| std::path::PathBuf::from("/usr/bin/ssh"));
 
     let mut cmd = Command::new(ssh_path);
@@ -203,7 +172,7 @@ fn exec_ssh(
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: {} <alias|user@host> [ssh options...]", args[0]);
@@ -216,28 +185,18 @@ async fn main() -> Result<()> {
     let (target, s3_key) = resolve_target(&cfg, alias)?;
 
     if cfg.minio_user.trim().is_empty() {
-        return Err("minio_user is not set in config.yaml (required when using S3 keys)".into());
+        return Err(
+            "minio_user is not set in config.yaml (required when using S3 keys)".to_string(),
+        );
     }
 
-    let access_key = &cfg.minio_user;
-
-    eprint!("Enter MinIO password for {}: ", access_key);
+    eprint!("Enter MinIO password for {}: ", &cfg.minio_user);
     let secret_key = rpassword::prompt_password("")
         .map_err(|e| format!("failed to read MinIO password: {}", e))?;
 
     eprintln!("Fetching key {} from S3...", s3_key);
 
-    let data = fetch_key(&cfg.endpoint, &cfg.bucket, &s3_key, access_key, &secret_key).await?;
-    let decrypted = maybe_decrypt_age(data)?;
-    let key_bytes = Some(decrypted);
-
-    // Create in-memory (tmpfs) key file if we have one
-    let key_file = if let Some(ref kb) = key_bytes {
-        Some(create_key_file(kb)?)
-    } else {
-        None
-    };
-
-    // Hand over to real ssh (this will not return on success)
+    let data = fetch_key(&cfg, &s3_key, &secret_key).await?;
+    let key_file = Some(create_key_file(&data)?);
     exec_ssh(&target, key_file, &extra_args)
 }
