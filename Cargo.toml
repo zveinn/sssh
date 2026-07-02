@@ -1,0 +1,16 @@
+[package]
+name = "gossh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+minio = "0.4"
+age = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+rpassword = "7"
+dirs = "5"
+nix = { version = "0.29", features = ["process", "fs", "ioctl"] }
+libc = "0.2"
+which = "6"
