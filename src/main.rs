@@ -38,7 +38,8 @@ fn load_config() -> Result<Config> {
         return Err(format!(
             "config file not found at {}\nCreate it or pass a direct user@host (e.g. user@1.2.3.4)",
             path.display()
-        ).into());
+        )
+        .into());
     }
 
     let data = std::fs::read_to_string(&path)?;
@@ -46,19 +47,18 @@ fn load_config() -> Result<Config> {
     Ok(cfg)
 }
 
-fn resolve_target(cfg: &Config, name: &str) -> Result<(String, Option<String>)> {
+fn resolve_target(cfg: &Config, name: &str) -> Result<(String, String)> {
     if let Some(alias) = cfg.aliases.get(name) {
         // If s3_key is not specified, default to the alias name itself (useful for flat bucket storage)
         let key = alias.s3_key.clone().unwrap_or_else(|| name.to_string());
-        return Ok((alias.target.clone(), Some(key)));
+        return Ok((alias.target.clone(), key));
     }
 
-    // Allow direct targets like user@ip or host
-    if name.contains('@') || name.contains('.') || name.contains(':') {
-        return Ok((name.to_string(), None));
-    }
-
-    Err(format!("unknown alias '{}' and it does not look like a direct SSH target", name).into())
+    Err(format!(
+        "unknown alias '{}' and it does not look like a direct SSH target",
+        name
+    )
+    .into())
 }
 
 async fn fetch_key(
@@ -68,14 +68,19 @@ async fn fetch_key(
     access_key: &str,
     secret_key: &str,
 ) -> Result<Vec<u8>> {
-    let base_url: BaseUrl = endpoint.parse().map_err(|e| format!("invalid S3 endpoint URL: {}", e))?;
+    let base_url: BaseUrl = endpoint
+        .parse()
+        .map_err(|e| format!("invalid S3 endpoint URL: {}", e))?;
     let provider = StaticProvider::new(access_key, secret_key, None);
 
     let client = MinioClient::new(base_url, Some(provider), None, None)
         .map_err(|e| format!("failed to create MinIO client: {}", e))?;
 
     let resp = client
-        .get_object(bucket, minio::s3::types::ObjectKey::new(key).map_err(|e| format!("{}", e))?)?
+        .get_object(
+            bucket,
+            minio::s3::types::ObjectKey::new(key).map_err(|e| format!("{}", e))?,
+        )?
         .build()
         .send()
         .await
@@ -98,8 +103,8 @@ fn maybe_decrypt_age(data: Vec<u8>) -> Result<Vec<u8>> {
 
     // Prompt on stderr
     eprint!("Enter passphrase for encrypted key: ");
-    let passphrase = rpassword::prompt_password("")
-        .map_err(|e| format!("failed to read passphrase: {}", e))?;
+    let passphrase =
+        rpassword::prompt_password("").map_err(|e| format!("failed to read passphrase: {}", e))?;
 
     let decryptor = match age::Decryptor::new(&data[..])? {
         age::Decryptor::Passphrase(d) => d,
@@ -134,7 +139,11 @@ fn create_key_file(key: &[u8]) -> Result<(String, std::fs::File)> {
     Ok((path, file))
 }
 
-fn exec_ssh(target: &str, key_file: Option<(String, std::fs::File)>, extra_args: &[String]) -> Result<()> {
+fn exec_ssh(
+    target: &str,
+    key_file: Option<(String, std::fs::File)>,
+    extra_args: &[String],
+) -> Result<()> {
     let ssh_path = which::which("ssh").unwrap_or_else(|_| std::path::PathBuf::from("/usr/bin/ssh"));
 
     let mut cmd = Command::new(ssh_path);
@@ -176,7 +185,9 @@ fn exec_ssh(target: &str, key_file: Option<(String, std::fs::File)>, extra_args:
     // We will unlink after ssh has had a chance to open it.
     let _keep_file = key_file;
 
-    let status = cmd.status().map_err(|e| format!("failed to execute ssh: {}", e))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to execute ssh: {}", e))?;
 
     // Now that ssh has started and opened the file, clean up the tmpfs entry.
     if let Some(p) = key_path {
@@ -201,45 +212,24 @@ async fn main() -> Result<()> {
 
     let alias = &args[1];
     let extra_args: Vec<String> = args[2..].to_vec();
+    let cfg = load_config()?;
+    let (target, s3_key) = resolve_target(&cfg, alias)?;
 
-    // Try to load config (optional if using direct target)
-    let cfg = load_config().ok();
-
-    let (target, s3_key) = if let Some(ref c) = cfg {
-        resolve_target(c, alias)?
-    } else {
-        // No config file - treat first arg as direct target
-        if alias.contains('@') || alias.contains('.') {
-            (alias.clone(), None)
-        } else {
-            return Err(format!(
-                "no config file found at ~/.secrets/gossh/config.yaml and '{}' does not look like a valid SSH target (user@host or host.name)",
-                alias
-            ).into());
-        }
-    };
-
-    let mut key_bytes: Option<Vec<u8>> = None;
-
-    if let Some(ref key_name) = s3_key {
-        let cfg = cfg.as_ref().unwrap();
-
-        if cfg.minio_user.trim().is_empty() {
-            return Err("minio_user is not set in config.yaml (required when using S3 keys)".into());
-        }
-
-        let access_key = &cfg.minio_user;
-
-        eprint!("Enter MinIO password for {}: ", access_key);
-        let secret_key = rpassword::prompt_password("")
-            .map_err(|e| format!("failed to read MinIO password: {}", e))?;
-
-        eprintln!("Fetching key {} from S3...", key_name);
-
-        let data = fetch_key(&cfg.endpoint, &cfg.bucket, key_name, access_key, &secret_key).await?;
-        let decrypted = maybe_decrypt_age(data)?;
-        key_bytes = Some(decrypted);
+    if cfg.minio_user.trim().is_empty() {
+        return Err("minio_user is not set in config.yaml (required when using S3 keys)".into());
     }
+
+    let access_key = &cfg.minio_user;
+
+    eprint!("Enter MinIO password for {}: ", access_key);
+    let secret_key = rpassword::prompt_password("")
+        .map_err(|e| format!("failed to read MinIO password: {}", e))?;
+
+    eprintln!("Fetching key {} from S3...", s3_key);
+
+    let data = fetch_key(&cfg.endpoint, &cfg.bucket, &s3_key, access_key, &secret_key).await?;
+    let decrypted = maybe_decrypt_age(data)?;
+    let key_bytes = Some(decrypted);
 
     // Create in-memory (tmpfs) key file if we have one
     let key_file = if let Some(ref kb) = key_bytes {
