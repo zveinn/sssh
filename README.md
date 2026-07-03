@@ -1,74 +1,58 @@
-# sssh (Rust)
+# sssh
 
-A small Rust wrapper around the real `ssh` binary.
+SSH with private keys stored in S3. The key is fetched at connect time, kept
+only in memory, and freed the moment authentication succeeds. Nothing is ever
+written to disk.
 
-- Fetches SSH private keys from S3 (or MinIO) using the official `minio` crate.
-- Supports age-encrypted keys (prompts for passphrase).
-- Never writes the private key to disk — uses Linux `memfd_create`.
-- Hands the key to `ssh` via `/proc/self/fd/3`.
-- Proper TTY / session / controlling terminal handover so you get a real interactive ssh.
+## How it works
 
-## Build
+1. Fetches the private key for your target from an S3 bucket (MinIO or any
+   S3-compatible store). You are prompted for the S3 secret key.
+2. Puts the key in an anonymous in-memory file (`memfd_create`) and points
+   `ssh -i` at it. It never touches the filesystem.
+3. As soon as ssh authenticates, the in-memory key is destroyed. Your session
+   keeps running normally.
+
+## Install
 
 ```bash
 cargo build --release
-./target/release/sssh ...
+sudo cp target/release/sssh /usr/local/bin/
 ```
 
-## Config
+Or grab a binary from the releases page.
 
-Place at `~/.secrets/sssh/config.yaml`:
+## Configure
+
+Create `~/.secrets/sssh/config.yaml` (see `config.yaml.example`):
 
 ```yaml
-endpoint: "https://s3.example.com"   # MinIO or S3-compatible endpoint
-bucket: "my-ssh-keys"
-minio_user: "my-minio-user"          # MinIO access key / username (password is prompted)
+endpoint: "https://s3.example.com"   # S3 or MinIO endpoint
+bucket: "ssh-keys"                   # bucket holding the private keys
+minio_user: "myuser"                 # access key; secret key is prompted
 
 aliases:
-  machine1:
-    target: "ec2-user@10.0.0.42"
-    s3_key: "machine1"   # optional. If omitted, defaults to the alias name (good for flat storage)
+  myserver:
+    target: "root@203.0.113.10"      # who/where to ssh into
+    s3_key: "myserver"               # object name in the bucket (optional,
+                                     # defaults to the alias name)
 ```
 
-Copy `config.yaml.example` as a starting point.
+Upload a private key to the bucket under the object name used by the alias.
 
-## Credentials
-
-- The MinIO **username** (access key) is taken from `minio_user` in the config file.
-- You will be **prompted** for the MinIO **password** (secret key) when fetching a key.
-- This avoids storing the secret in the config or environment.
-
-## Usage
+## Use
 
 ```bash
-./sssh machine1
-./sssh machine1 -L 8080:localhost:8080
-./sssh prod -- whoami
-```
-
-You can also pass a raw target if no alias matches:
-
-```bash
-./sssh ec2-user@1.2.3.4
-```
-
-## Preparing an encrypted key
-
-```bash
-age -p -o id_ed25519.age < ~/.ssh/id_ed25519
-mc cp id_ed25519.age storage/secrets/machine1
-# or with MinIO client
+sssh myserver
+sssh myserver -L 8080:localhost:8080   # extra args are passed to ssh
 ```
 
 ## Notes
 
-- Linux only (memfd + /proc/self/fd + setsid/TIOCSCTTY).
-- The real `ssh` is executed, so you keep full compatibility.
-- The binary is currently quite large due to tokio + reqwest + minio + age.
+- Linux only.
+- Runs your real `ssh`, so options, config and behavior all work as usual.
+- To watch the key appear and disappear from memory:
 
-## Development
-
-```bash
-cargo run -- machine1
-cargo check
-```
+  ```bash
+  watch -n 0.2 "find /proc/[0-9]*/fd -lname '/memfd:sssh-key*' 2>/dev/null"
+  ```

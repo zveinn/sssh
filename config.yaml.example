@@ -1,17 +1,12 @@
-# ~/.secrets/sssh/config.yaml
-endpoint: "https://s3.amazonaws.com"   # or your MinIO URL e.g. "http://127.0.0.1:9000"
-bucket: "my-ssh-keys"
-minio_user: "my-minio-user"            # the access key / username. Password will be prompted at runtime.
+# Copy to ~/.secrets/sssh/config.yaml
+endpoint: "https://s3.example.com"   # S3 or MinIO endpoint
+bucket: "ssh-keys"                   # bucket holding the private keys
+minio_user: "myuser"                 # access key; secret key is prompted at runtime
 
 aliases:
-  machine1:
-    target: "ec2-user@10.0.0.123"
-    s3_key: "machine1"   # optional - if omitted, uses the alias name directly (flat storage)
+  myserver:
+    target: "root@203.0.113.10"
+    s3_key: "myserver"   # object name in the bucket (optional, defaults to the alias name)
 
-  prod:
-    target: "root@prod.example.com"
-    s3_key: "prod"     # optional - if omitted, uses the alias name directly
-
-  # Direct aliases without S3 (uses normal ssh auth)
-  local:
-    target: "sveinn@devbox"
+  otherserver:
+    target: "admin@otherserver.example.com"
