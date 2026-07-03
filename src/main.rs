@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -10,7 +9,6 @@ use minio::s3::creds::StaticProvider;
 use minio::s3::http::BaseUrl;
 use minio::s3::types::S3Api;
 use minio::s3::MinioClient;
-use nix::unistd::setsid;
 use serde::Deserialize;
 use zeroize::Zeroize;
 
@@ -186,22 +184,9 @@ fn exec_ssh(target: &str, key_fd: RawFd, extra_args: &[String]) -> Result<(), St
     cmd.arg("-o")
         .arg(format!("LocalCommand=kill -USR1 {}", std::process::id()));
 
-    // Set up controlling terminal etc.
-    unsafe {
-        cmd.pre_exec(|| {
-            let _ = setsid();
-
-            if let Ok(tty) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/tty")
-            {
-                let _ = libc::ioctl(tty.as_raw_fd(), libc::TIOCSCTTY, 0);
-            }
-
-            Ok(())
-        });
-    }
+    // No setsid/TIOCSCTTY: ssh must stay in our (foreground) process group
+    // so the kernel delivers SIGWINCH to it on terminal resize — otherwise
+    // window-size changes never reach the remote side.
 
     cmd.arg(target);
     cmd.args(extra_args);
