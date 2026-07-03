@@ -30,7 +30,7 @@ struct Alias {
 
 fn load_config() -> Result<Config, String> {
     let home = dirs::home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
-    let path = home.join(".secrets/gossh/config.yaml");
+    let path = home.join(".secrets/sssh/config.yaml");
 
     if !path.exists() {
         return Err(format!(
@@ -105,7 +105,7 @@ fn create_key_memfd(key: &[u8]) -> Result<File, String> {
     // Anonymous in-memory file: never touches the filesystem, vanishes when
     // the last fd to it is closed. ssh reads it via /proc/<our-pid>/fd/N, so
     // the fd only needs to live in this process (CLOEXEC keeps it out of ssh).
-    let fd = unsafe { libc::memfd_create(c"gossh-key".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe { libc::memfd_create(c"sssh-key".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(format!(
             "memfd_create failed: {}",
@@ -167,7 +167,7 @@ fn exec_ssh(target: &str, key_fd: RawFd, extra_args: &[String]) -> Result<(), St
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
 
-    // The key exists only as a memfd held open by this (gossh) process. ssh
+    // The key exists only as a memfd held open by this (sssh) process. ssh
     // closes all inherited fds above stderr at startup (closefrom), so it
     // cannot see the fd as /proc/self/fd/N — instead point it at our copy,
     // which stays open for the whole session. IdentitiesOnly pins ssh to
@@ -178,7 +178,7 @@ fn exec_ssh(target: &str, key_fd: RawFd, extra_args: &[String]) -> Result<(), St
         .arg(format!("/proc/{}/fd/{}", std::process::id(), key_fd));
     cmd.env_remove("SSH_AUTH_SOCK");
 
-    // LocalCommand runs after authentication succeeds — tell gossh to
+    // LocalCommand runs after authentication succeeds — tell sssh to
     // release the key (see close_key_fd)
     cmd.arg("-o").arg("PermitLocalCommand=yes");
     cmd.arg("-o")
@@ -241,7 +241,7 @@ async fn main() -> Result<(), String> {
     data.zeroize();
 
     // Hand ownership of the fd to the signal handler: it is closed on
-    // SIGUSR1 (post-auth), or by the kernel when gossh exits.
+    // SIGUSR1 (post-auth), or by the kernel when sssh exits.
     let key_fd = key_file.into_raw_fd();
     install_key_release_handler(key_fd)?;
 

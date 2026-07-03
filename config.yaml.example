@@ -1,4 +1,4 @@
-# ~/.secrets/gossh/config.yaml
+# ~/.secrets/sssh/config.yaml
 endpoint: "https://s3.amazonaws.com"   # or your MinIO URL e.g. "http://127.0.0.1:9000"
 bucket: "my-ssh-keys"
 minio_user: "my-minio-user"            # the access key / username. Password will be prompted at runtime.

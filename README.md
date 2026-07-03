@@ -1,4 +1,4 @@
-# gossh (Rust)
+# sssh (Rust)
 
 A small Rust wrapper around the real `ssh` binary.
 
@@ -12,12 +12,12 @@ A small Rust wrapper around the real `ssh` binary.
 
 ```bash
 cargo build --release
-./target/release/gossh ...
+./target/release/sssh ...
 ```
 
 ## Config
 
-Place at `~/.secrets/gossh/config.yaml`:
+Place at `~/.secrets/sssh/config.yaml`:
 
 ```yaml
 endpoint: "https://s3.example.com"   # MinIO or S3-compatible endpoint
@@ -41,15 +41,15 @@ Copy `config.yaml.example` as a starting point.
 ## Usage
 
 ```bash
-./gossh machine1
-./gossh machine1 -L 8080:localhost:8080
-./gossh prod -- whoami
+./sssh machine1
+./sssh machine1 -L 8080:localhost:8080
+./sssh prod -- whoami
 ```
 
 You can also pass a raw target if no alias matches:
 
 ```bash
-./gossh ec2-user@1.2.3.4
+./sssh ec2-user@1.2.3.4
 ```
 
 ## Preparing an encrypted key
