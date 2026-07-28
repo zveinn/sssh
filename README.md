@@ -11,6 +11,10 @@ written to disk and the bucket only ever sees ciphertext.
    password (argon2id with a random per-key salt) and uploads it to an S3
    bucket (MinIO or any S3-compatible store). Each key gets its own salt,
    stored alongside the ciphertext, so no two keys ever share a derived key.
+   `sssh gen-key` does the same with a freshly generated ed25519 key that
+   never exists outside process memory, and `sssh pub-key` prints the
+   public key of a stored key (for `authorized_keys`) without writing
+   anything to disk.
 2. `sssh <alias>` fetches the encrypted key, prompts for your password and
    decrypts it in memory.
 3. The key goes into an anonymous in-memory file (`memfd_create`) and
@@ -26,6 +30,21 @@ sudo cp target/release/sssh /usr/local/bin/
 ```
 
 Or grab a binary from the releases page.
+
+## MinIO setup
+
+Create the bucket and a user that can only touch that bucket (the policy is
+in `policy.json`, scoped to the `ssh-keys` bucket):
+
+```bash
+mc mb myminio/ssh-keys
+mc admin user add myminio sssh 'ChangeMePlease'
+mc admin policy create myminio sssh-keys-rw policy.json
+mc admin policy attach myminio sssh-keys-rw --user sssh
+```
+
+Use that user's credentials in the config below. If you rename the bucket,
+update the `Resource` ARNs in `policy.json` to match.
 
 ## Configure
 
@@ -49,6 +68,13 @@ Add a key (encrypts it locally, uploads it, creates the alias):
 sssh add-key myserver root@203.0.113.10 myserver ~/.ssh/id_ed25519
 ```
 
+Or generate a brand-new ed25519 key that never exists outside memory — it is
+created in-process, encrypted and uploaded without ever touching disk:
+
+```bash
+sssh gen-key myserver root@203.0.113.10 myserver
+```
+
 Connect:
 
 ```bash
@@ -56,8 +82,15 @@ sssh myserver
 sssh myserver -L 8080:localhost:8080   # extra args are passed to ssh
 ```
 
-You are prompted for the encryption password on both. The alias name
-`add-key` is reserved.
+Print the public key for a stored private key (fetches and decrypts it in
+memory, derives the public key in-process, never writes to disk):
+
+```bash
+sssh pub-key myserver
+```
+
+You are prompted for the encryption password on all of these. The alias
+names `add-key`, `gen-key` and `pub-key` are reserved.
 
 ## Notes
 

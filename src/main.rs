@@ -22,6 +22,7 @@ use zeroize::Zeroize;
 // random per key and stored in the blob, so every key derives an independent
 // encryption key. The magic both versions the format and catches "this object
 // was never encrypted".
+//
 const MAGIC: &[u8] = b"sssh2";
 const NONCE_LEN: usize = 12;
 const SALT_LEN: usize = 16;
@@ -256,34 +257,28 @@ fn prompt_password(prompt: &str) -> Result<String, String> {
     res.map_err(|e| format!("failed to read password: {}", e))
 }
 
-async fn add_key(alias: &str, target: &str, s3_key: &str, key_path: &str) -> Result<(), String> {
-    if alias == "add-key" {
-        return Err("alias 'add-key' is reserved (it is the add-key command)".to_string());
+fn reserved_alias_check(alias: &str) -> Result<(), String> {
+    const COMMANDS: &[&str] = &["add-key", "pub-key", "gen-key"];
+    if COMMANDS.contains(&alias) {
+        return Err(format!("alias '{}' is reserved (it is a command)", alias));
     }
+    Ok(())
+}
 
-    let mut cfg = load_config()?;
-
-    let mut plaintext = std::fs::read(key_path)
-        .map_err(|e| format!("failed to read key file {}: {}", key_path, e))?;
-
+// Prompt for the encryption password twice and return it once confirmed.
+fn prompt_new_password() -> Result<String, String> {
     let mut password = prompt_password("Enter encryption password: ")?;
     let mut confirm = prompt_password("Confirm encryption password: ")?;
     if password != confirm {
         password.zeroize();
         confirm.zeroize();
-        plaintext.zeroize();
         return Err("passwords do not match".to_string());
     }
     confirm.zeroize();
+    Ok(password)
+}
 
-    let blob = encrypt_key(&plaintext, &password);
-    password.zeroize();
-    plaintext.zeroize();
-    let blob = blob?;
-
-    eprintln!("Uploading encrypted key to s3://{}/{}...", cfg.bucket, s3_key);
-    upload_key(&cfg, s3_key, blob).await?;
-
+fn record_alias(cfg: &mut Config, alias: &str, target: &str, s3_key: &str) -> Result<(), String> {
     if cfg.aliases.contains_key(alias) {
         eprintln!("note: replacing existing alias '{}'", alias);
     }
@@ -294,9 +289,129 @@ async fn add_key(alias: &str, target: &str, s3_key: &str, key_path: &str) -> Res
             s3_key: Some(s3_key.to_string()),
         },
     );
-    save_config(&cfg)?;
+    save_config(cfg)
+}
+
+async fn add_key(alias: &str, target: &str, s3_key: &str, key_path: &str) -> Result<(), String> {
+    reserved_alias_check(alias)?;
+
+    let mut cfg = load_config()?;
+
+    let mut password = prompt_new_password()?;
+
+    let mut plaintext = std::fs::read(key_path)
+        .map_err(|e| format!("failed to read key file {}: {}", key_path, e))
+        .map_err(|e| {
+            password.zeroize();
+            e
+        })?;
+
+    let blob = encrypt_key(&plaintext, &password);
+    password.zeroize();
+    plaintext.zeroize();
+    let blob = blob?;
+
+    eprintln!(
+        "Uploading encrypted key to s3://{}/{}...",
+        cfg.bucket, s3_key
+    );
+    upload_key(&cfg, s3_key, blob).await?;
+
+    record_alias(&mut cfg, alias, target, s3_key)?;
 
     eprintln!("Added alias '{}' -> {} (key: {})", alias, target, s3_key);
+    Ok(())
+}
+
+// Generate a fresh ed25519 keypair entirely in memory: the private key is
+// encrypted and uploaded without ever existing outside this process, and the
+// public key is discarded — derive it any time with `sssh pub-key <alias>`.
+async fn gen_key(alias: &str, target: &str, s3_key: &str) -> Result<(), String> {
+    reserved_alias_check(alias)?;
+
+    let mut cfg = load_config()?;
+
+    let mut password = prompt_new_password()?;
+
+    let private_key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519)
+        .map_err(|e| format!("key generation failed: {}", e));
+    let private_key = match private_key {
+        Ok(k) => k,
+        Err(e) => {
+            password.zeroize();
+            return Err(e);
+        }
+    };
+    let fingerprint = private_key.fingerprint(ssh_key::HashAlg::Sha256);
+
+    // Zeroizing<String>: the OpenSSH-encoded plaintext wipes itself on drop,
+    // and PrivateKey zeroizes its key material on drop as well.
+    let pem = private_key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .map_err(|e| format!("failed to encode private key: {}", e));
+    let pem = match pem {
+        Ok(p) => p,
+        Err(e) => {
+            password.zeroize();
+            return Err(e);
+        }
+    };
+
+    let blob = encrypt_key(pem.as_bytes(), &password);
+    password.zeroize();
+    drop(pem);
+    drop(private_key);
+    let blob = blob?;
+
+    eprintln!(
+        "Uploading encrypted key to s3://{}/{}...",
+        cfg.bucket, s3_key
+    );
+    upload_key(&cfg, s3_key, blob).await?;
+
+    record_alias(&mut cfg, alias, target, s3_key)?;
+
+    eprintln!(
+        "Generated ed25519 key for '{}' -> {} (key: {})\nFingerprint: {}",
+        alias, target, s3_key, fingerprint
+    );
+    eprintln!(
+        "Run `sssh pub-key {}` to print the public key for authorized_keys.",
+        alias
+    );
+    Ok(())
+}
+
+// Derive the public key from a stored private key, entirely in-process. The
+// OpenSSH format keeps the public half unencrypted next to the private part,
+// so this works even if the key carries its own ssh passphrase — the private
+// material is parsed but never used, and is zeroized on drop.
+async fn pub_key(alias: &str) -> Result<(), String> {
+    let cfg = load_config()?;
+    let (_, s3_key) = resolve_target(&cfg, alias)?;
+
+    eprintln!("Fetching key {} from S3...", s3_key);
+    let blob = fetch_key(&cfg, &s3_key).await?;
+
+    let mut password = prompt_password(&format!("Enter encryption password for {}: ", alias))?;
+    let data = decrypt_key(&blob, &password);
+    password.zeroize();
+    let mut data = data?;
+
+    let key = ssh_key::PrivateKey::from_openssh(&data).map_err(|e| {
+        format!(
+            "failed to parse private key (OpenSSH format expected): {}",
+            e
+        )
+    });
+    data.zeroize();
+    let key = key?;
+
+    let pubkey = key
+        .public_key()
+        .to_openssh()
+        .map_err(|e| format!("failed to encode public key: {}", e))?;
+    println!("{}", pubkey);
     Ok(())
 }
 
@@ -427,8 +542,8 @@ async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <alias> [ssh options...]\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>",
-            args[0], args[0]
+            "Usage: {} <alias> [ssh options...]\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>\n       {} gen-key <alias> <user@host[:port]> <s3_keyname>\n       {} pub-key <alias>",
+            args[0], args[0], args[0], args[0]
         );
         std::process::exit(2);
     }
@@ -442,6 +557,25 @@ async fn main() -> Result<(), String> {
             std::process::exit(2);
         }
         return add_key(&args[2], &args[3], &args[4], &args[5]).await;
+    }
+
+    if args[1] == "gen-key" {
+        if args.len() != 5 {
+            eprintln!(
+                "Usage: {} gen-key <alias> <user@host[:port]> <s3_keyname>",
+                args[0]
+            );
+            std::process::exit(2);
+        }
+        return gen_key(&args[2], &args[3], &args[4]).await;
+    }
+
+    if args[1] == "pub-key" {
+        if args.len() != 3 {
+            eprintln!("Usage: {} pub-key <alias>", args[0]);
+            std::process::exit(2);
+        }
+        return pub_key(&args[2]).await;
     }
 
     let alias = &args[1];
@@ -496,6 +630,18 @@ mod tests {
         assert_ne!(salt_a, salt_b, "salt must be random per key");
         // Different salt (and nonce) => different ciphertext for identical input.
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn generated_key_survives_encrypt_roundtrip() {
+        // The gen-key path: random ed25519 key -> OpenSSH encoding ->
+        // encrypt -> decrypt -> still a valid key with the same public half.
+        let key = ssh_key::PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        let pem = key.to_openssh(ssh_key::LineEnding::LF).unwrap();
+        let blob = encrypt_key(pem.as_bytes(), "pw").unwrap();
+        let out = decrypt_key(&blob, "pw").unwrap();
+        let parsed = ssh_key::PrivateKey::from_openssh(&out).unwrap();
+        assert_eq!(parsed.public_key(), key.public_key());
     }
 
     #[test]
