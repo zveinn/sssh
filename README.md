@@ -89,8 +89,24 @@ memory, derives the public key in-process, never writes to disk):
 sssh pub-key myserver
 ```
 
-You are prompted for the encryption password on all of these. The alias
-names `add-key`, `gen-key` and `pub-key` are reserved.
+List keys (aliases from the config cross-checked against the bucket — also
+shows objects with no alias and aliases whose object is gone):
+
+```bash
+sssh list-keys
+```
+
+Delete a key (removes the encrypted object from the bucket and the alias
+from the config — asks you to type the alias back, since the bucket holds
+the only copy):
+
+```bash
+sssh del-key myserver
+```
+
+You are prompted for the encryption password on all of these (except
+`del-key` and `list-keys`). The alias names `add-key`, `gen-key`,
+`pub-key`, `del-key` and `list-keys` are reserved.
 
 ## Notes
 

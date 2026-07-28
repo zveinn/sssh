@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
@@ -13,7 +13,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use minio::s3::creds::StaticProvider;
 use minio::s3::http::BaseUrl;
 use minio::s3::segmented_bytes::SegmentedBytes;
-use minio::s3::types::S3Api;
+use futures_util::StreamExt;
+use minio::s3::types::{S3Api, ToStream};
 use minio::s3::MinioClient;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -258,7 +259,7 @@ fn prompt_password(prompt: &str) -> Result<String, String> {
 }
 
 fn reserved_alias_check(alias: &str) -> Result<(), String> {
-    const COMMANDS: &[&str] = &["add-key", "pub-key", "gen-key"];
+    const COMMANDS: &[&str] = &["add-key", "pub-key", "gen-key", "del-key", "list-keys"];
     if COMMANDS.contains(&alias) {
         return Err(format!("alias '{}' is reserved (it is a command)", alias));
     }
@@ -379,6 +380,121 @@ async fn gen_key(alias: &str, target: &str, s3_key: &str) -> Result<(), String> 
         "Run `sssh pub-key {}` to print the public key for authorized_keys.",
         alias
     );
+    Ok(())
+}
+
+async fn delete_object(cfg: &Config, key: &str) -> Result<(), String> {
+    let client = make_client(cfg)?;
+    client
+        .delete_object(&cfg.bucket, key)
+        .map_err(|e| format!("minio delete_object failed: {}", e))?
+        .build()
+        .send()
+        .await
+        .map_err(|e| format!("failed to delete object s3://{}/{}: {}", cfg.bucket, key, e))?;
+    Ok(())
+}
+
+// List aliases cross-referenced against the bucket: flags aliases whose
+// object is gone and objects no alias points at.
+async fn list_keys() -> Result<(), String> {
+    let cfg = load_config()?;
+    let client = make_client(&cfg)?;
+
+    let mut stream = client
+        .list_objects(&cfg.bucket)
+        .map_err(|e| format!("minio list_objects failed: {}", e))?
+        .build()
+        .to_stream()
+        .await;
+
+    let mut contents = Vec::new();
+    while let Some(page) = stream.next().await {
+        let page = page.map_err(|e| format!("failed to list s3://{}: {}", cfg.bucket, e))?;
+        contents.extend(page.contents);
+    }
+
+    let object_names: HashSet<&str> = contents
+        .iter()
+        .filter(|o| !o.is_prefix)
+        .map(|o| o.name.as_str())
+        .collect();
+
+    let resolved_key = |name: &str, a: &Alias| a.s3_key.clone().unwrap_or_else(|| name.to_string());
+
+    let mut aliases: Vec<(&String, &Alias)> = cfg.aliases.iter().collect();
+    aliases.sort_by(|a, b| a.0.cmp(b.0));
+
+    println!("{:<20} {:<30} {:<20} {}", "ALIAS", "TARGET", "S3 KEY", "STATUS");
+    for (name, a) in &aliases {
+        let key = resolved_key(name, a);
+        let status = if object_names.contains(key.as_str()) {
+            "ok"
+        } else {
+            "MISSING from bucket"
+        };
+        println!("{:<20} {:<30} {:<20} {}", name, a.target, key, status);
+    }
+
+    let referenced: HashSet<String> = cfg
+        .aliases
+        .iter()
+        .map(|(name, a)| resolved_key(name, a))
+        .collect();
+    for o in &contents {
+        if !o.is_prefix && !referenced.contains(&o.name) {
+            println!("{:<20} {:<30} {:<20} {}", "-", "-", o.name, "no alias in this config");
+        }
+    }
+    Ok(())
+}
+
+// Delete a stored key: remove the encrypted object from the bucket and the
+// alias from the config. Deleting the object is unrecoverable (the bucket
+// holds the only copy), so the alias name must be typed back to confirm. If
+// other aliases still point at the same object, only the alias is removed.
+async fn del_key(alias: &str) -> Result<(), String> {
+    let mut cfg = load_config()?;
+    let (target, s3_key) = resolve_target(&cfg, alias)?;
+
+    let shared: Vec<String> = cfg
+        .aliases
+        .iter()
+        .filter(|(name, a)| {
+            name.as_str() != alias
+                && a.s3_key.clone().unwrap_or_else(|| (*name).clone()) == s3_key
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    if shared.is_empty() {
+        eprintln!(
+            "This permanently deletes s3://{}/{} and removes alias '{}' ({}).\nThe encrypted key cannot be recovered afterwards.",
+            cfg.bucket, s3_key, alias, target
+        );
+    } else {
+        eprintln!(
+            "Aliases {:?} still use key '{}', so only the alias '{}' ({}) will be removed; the object stays in the bucket.",
+            shared, s3_key, alias, target
+        );
+    }
+    eprint!("Type the alias name to confirm: ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("failed to read confirmation: {}", e))?;
+    if input.trim() != alias {
+        return Err("confirmation did not match, nothing deleted".to_string());
+    }
+
+    if shared.is_empty() {
+        delete_object(&cfg, &s3_key).await?;
+        eprintln!("Deleted s3://{}/{}", cfg.bucket, s3_key);
+    }
+
+    cfg.aliases.remove(alias);
+    save_config(&cfg)?;
+    eprintln!("Removed alias '{}'", alias);
     Ok(())
 }
 
@@ -542,8 +658,8 @@ async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <alias> [ssh options...]\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>\n       {} gen-key <alias> <user@host[:port]> <s3_keyname>\n       {} pub-key <alias>",
-            args[0], args[0], args[0], args[0]
+            "Usage: {} <alias> [ssh options...]\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>\n       {} gen-key <alias> <user@host[:port]> <s3_keyname>\n       {} pub-key <alias>\n       {} del-key <alias>\n       {} list-keys",
+            args[0], args[0], args[0], args[0], args[0], args[0]
         );
         std::process::exit(2);
     }
@@ -576,6 +692,22 @@ async fn main() -> Result<(), String> {
             std::process::exit(2);
         }
         return pub_key(&args[2]).await;
+    }
+
+    if args[1] == "list-keys" {
+        if args.len() != 2 {
+            eprintln!("Usage: {} list-keys", args[0]);
+            std::process::exit(2);
+        }
+        return list_keys().await;
+    }
+
+    if args[1] == "del-key" {
+        if args.len() != 3 {
+            eprintln!("Usage: {} del-key <alias>", args[0]);
+            std::process::exit(2);
+        }
+        return del_key(&args[2]).await;
     }
 
     let alias = &args[1];
