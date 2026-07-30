@@ -15,8 +15,8 @@ written to disk and the bucket only ever sees ciphertext.
    never exists outside process memory, and `sssh pub-key` prints the
    public key of a stored key (for `authorized_keys`) without writing
    anything to disk.
-2. `sssh <alias>` fetches the encrypted key, prompts for your password and
-   decrypts it in memory.
+2. `sssh connect <alias>` fetches the encrypted key, prompts for your
+   password and decrypts it in memory.
 3. The key goes into an anonymous in-memory file (`memfd_create`) and
    `ssh -i` is pointed at it. It never touches the filesystem.
 4. As soon as ssh authenticates, the in-memory key is destroyed. Your session
@@ -78,8 +78,8 @@ sssh gen-key myserver root@203.0.113.10 myserver
 Connect:
 
 ```bash
-sssh myserver
-sssh myserver -L 8080:localhost:8080   # extra args are passed to ssh
+sssh connect myserver
+sssh c myserver -L 8080:localhost:8080   # extra args are passed to ssh
 ```
 
 Print the public key for a stored private key (fetches and decrypts it in
@@ -104,9 +104,20 @@ the only copy):
 sssh del-key myserver
 ```
 
+Every command has shortcuts:
+
+| Command     | Shortcuts        |
+|-------------|------------------|
+| `connect`   | `con`, `c`       |
+| `add-key`   | `add`, `a`       |
+| `gen-key`   | `gen`, `g`       |
+| `pub-key`   | `pub`, `p`       |
+| `del-key`   | `del`, `d`       |
+| `list-keys` | `list`, `ls`, `l`|
+
 You are prompted for the encryption password on all of these (except
-`del-key` and `list-keys`). The alias names `add-key`, `gen-key`,
-`pub-key`, `del-key` and `list-keys` are reserved.
+`del-key` and `list-keys`). Command names and their shortcuts are reserved
+and cannot be used as alias names.
 
 ## Notes
 

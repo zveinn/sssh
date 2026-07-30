@@ -258,10 +258,25 @@ fn prompt_password(prompt: &str) -> Result<String, String> {
     res.map_err(|e| format!("failed to read password: {}", e))
 }
 
+// Map a command name or one of its shortcuts to the canonical command.
+fn canonical_command(name: &str) -> Option<&'static str> {
+    match name {
+        "connect" | "con" | "c" => Some("connect"),
+        "add-key" | "add" | "a" => Some("add-key"),
+        "gen-key" | "gen" | "g" => Some("gen-key"),
+        "pub-key" | "pub" | "p" => Some("pub-key"),
+        "del-key" | "del" | "d" => Some("del-key"),
+        "list-keys" | "list" | "ls" | "l" => Some("list-keys"),
+        _ => None,
+    }
+}
+
 fn reserved_alias_check(alias: &str) -> Result<(), String> {
-    const COMMANDS: &[&str] = &["add-key", "pub-key", "gen-key", "del-key", "list-keys"];
-    if COMMANDS.contains(&alias) {
-        return Err(format!("alias '{}' is reserved (it is a command)", alias));
+    if canonical_command(alias).is_some() {
+        return Err(format!(
+            "alias '{}' is reserved (it is a command or a command shortcut)",
+            alias
+        ));
     }
     Ok(())
 }
@@ -658,60 +673,72 @@ async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "Usage: {} <alias> [ssh options...]\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>\n       {} gen-key <alias> <user@host[:port]> <s3_keyname>\n       {} pub-key <alias>\n       {} del-key <alias>\n       {} list-keys",
+            "Usage: {} connect <alias> [ssh options...]   (con, c)\n       {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>   (add, a)\n       {} gen-key <alias> <user@host[:port]> <s3_keyname>                     (gen, g)\n       {} pub-key <alias>    (pub, p)\n       {} del-key <alias>    (del, d)\n       {} list-keys          (list, ls, l)",
             args[0], args[0], args[0], args[0], args[0], args[0]
         );
         std::process::exit(2);
     }
 
-    if args[1] == "add-key" {
-        if args.len() != 6 {
+    match canonical_command(&args[1]) {
+        Some("add-key") => {
+            if args.len() != 6 {
+                eprintln!(
+                    "Usage: {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>",
+                    args[0]
+                );
+                std::process::exit(2);
+            }
+            return add_key(&args[2], &args[3], &args[4], &args[5]).await;
+        }
+        Some("gen-key") => {
+            if args.len() != 5 {
+                eprintln!(
+                    "Usage: {} gen-key <alias> <user@host[:port]> <s3_keyname>",
+                    args[0]
+                );
+                std::process::exit(2);
+            }
+            return gen_key(&args[2], &args[3], &args[4]).await;
+        }
+        Some("pub-key") => {
+            if args.len() != 3 {
+                eprintln!("Usage: {} pub-key <alias>", args[0]);
+                std::process::exit(2);
+            }
+            return pub_key(&args[2]).await;
+        }
+        Some("del-key") => {
+            if args.len() != 3 {
+                eprintln!("Usage: {} del-key <alias>", args[0]);
+                std::process::exit(2);
+            }
+            return del_key(&args[2]).await;
+        }
+        Some("list-keys") => {
+            if args.len() != 2 {
+                eprintln!("Usage: {} list-keys", args[0]);
+                std::process::exit(2);
+            }
+            return list_keys().await;
+        }
+        Some("connect") => {
+            if args.len() < 3 {
+                eprintln!("Usage: {} connect <alias> [ssh options...]", args[0]);
+                std::process::exit(2);
+            }
+            return connect(&args[2], &args[3..]).await;
+        }
+        _ => {
             eprintln!(
-                "Usage: {} add-key <alias> <user@host[:port]> <s3_keyname> <path_to_ssh_key>",
-                args[0]
+                "unknown command '{}' — to connect, use: {} connect {}",
+                args[1], args[0], args[1]
             );
             std::process::exit(2);
         }
-        return add_key(&args[2], &args[3], &args[4], &args[5]).await;
     }
+}
 
-    if args[1] == "gen-key" {
-        if args.len() != 5 {
-            eprintln!(
-                "Usage: {} gen-key <alias> <user@host[:port]> <s3_keyname>",
-                args[0]
-            );
-            std::process::exit(2);
-        }
-        return gen_key(&args[2], &args[3], &args[4]).await;
-    }
-
-    if args[1] == "pub-key" {
-        if args.len() != 3 {
-            eprintln!("Usage: {} pub-key <alias>", args[0]);
-            std::process::exit(2);
-        }
-        return pub_key(&args[2]).await;
-    }
-
-    if args[1] == "list-keys" {
-        if args.len() != 2 {
-            eprintln!("Usage: {} list-keys", args[0]);
-            std::process::exit(2);
-        }
-        return list_keys().await;
-    }
-
-    if args[1] == "del-key" {
-        if args.len() != 3 {
-            eprintln!("Usage: {} del-key <alias>", args[0]);
-            std::process::exit(2);
-        }
-        return del_key(&args[2]).await;
-    }
-
-    let alias = &args[1];
-    let extra_args: Vec<String> = args[2..].to_vec();
+async fn connect(alias: &str, extra_args: &[String]) -> Result<(), String> {
     let cfg = load_config()?;
     let (target, s3_key) = resolve_target(&cfg, alias)?;
 
@@ -731,7 +758,7 @@ async fn main() -> Result<(), String> {
     let key_fd = key_file.into_raw_fd();
     install_key_release_handler(key_fd)?;
 
-    exec_ssh(&normalize_target(&target), key_fd, &extra_args)
+    exec_ssh(&normalize_target(&target), key_fd, extra_args)
 }
 
 #[cfg(test)]
@@ -774,6 +801,26 @@ mod tests {
         let out = decrypt_key(&blob, "pw").unwrap();
         let parsed = ssh_key::PrivateKey::from_openssh(&out).unwrap();
         assert_eq!(parsed.public_key(), key.public_key());
+    }
+
+    #[test]
+    fn shortcuts_map_to_canonical_commands() {
+        for (canonical, shortcuts) in [
+            ("connect", &["connect", "con", "c"][..]),
+            ("add-key", &["add-key", "add", "a"]),
+            ("gen-key", &["gen-key", "gen", "g"]),
+            ("pub-key", &["pub-key", "pub", "p"]),
+            ("del-key", &["del-key", "del", "d"]),
+            ("list-keys", &["list-keys", "list", "ls", "l"]),
+        ] {
+            for s in shortcuts {
+                assert_eq!(canonical_command(s), Some(canonical));
+                // every command spelling must be unusable as an alias name
+                assert!(reserved_alias_check(s).is_err());
+            }
+        }
+        assert_eq!(canonical_command("myserver"), None);
+        assert!(reserved_alias_check("myserver").is_ok());
     }
 
     #[test]
